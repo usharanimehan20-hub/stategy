@@ -91,6 +91,31 @@ def resample_30m(df: pd.DataFrame) -> pd.DataFrame:
     return df.resample("30min", label="left", closed="left").agg(agg).dropna()
 
 
+def resample_1h(df: pd.DataFrame) -> pd.DataFrame:
+    """Resample any-TF OHLC to 1-hour OHLC (used for HTF-confluence filter)."""
+    agg = {"open": "first", "high": "max", "low": "min", "close": "last"}
+    return df.resample("1h", label="left", closed="left").agg(agg).dropna()
+
+
+def build_htf_bias_aligned(df_low: pd.DataFrame, bias_index: pd.DatetimeIndex,
+                           htf: str = "1h") -> pd.Series:
+    """
+    Build a HTF (default 1H) bias series and align it to `bias_index` (the 15M
+    or 30M setup index) using as-of/forward-fill. The 1H bias of a bar at time T
+    is only available from T+1H onward, so we shift before reindexing.
+    Returns an int Series of {-1,0,+1} the same length as bias_index.
+    """
+    if htf != "1h":
+        raise ValueError(f"unsupported htf: {htf}")
+    df_h = add_bias_indicators(resample_1h(df_low))
+    bias_h = classify_bias(df_h, ("wma34", "wma64", "ema55", "ema100"))
+    # Availability shift: 1H bar starting at T closes at T+1H.
+    bias_avail = bias_h.copy()
+    bias_avail.index = bias_avail.index + pd.Timedelta(hours=1)
+    aligned = bias_avail.reindex(bias_index, method="ffill").fillna(0).astype(int)
+    return aligned
+
+
 # ---------------------------------------------------------------------------
 # 2. Indicators
 # ---------------------------------------------------------------------------
@@ -253,9 +278,23 @@ def detect_signals(df_1m: pd.DataFrame, df_15: pd.DataFrame,
                    swing_high: Optional[np.ndarray] = None,
                    swing_low: Optional[np.ndarray] = None,
                    session_hours: Optional[set[int]] = None,
-                   bias_tf_minutes: int = 15) -> list[Signal]:
+                   bias_tf_minutes: int = 15,
+                   bias_1h_aligned: Optional[pd.Series] = None,
+                   ma_sep_min: Optional[float] = None,
+                   max_ext_pts: Optional[float] = None,
+                   body_frac_min: Optional[float] = None) -> list[Signal]:
     """
     Candle Theory — setup on 15M, entry trigger on 1M.
+
+    Optional filters (default None/off, fully backward compatible):
+      bias_1h_aligned : Series of 1H bias aligned to df_15.index. When provided
+                        require bias_1h == bias_15 at setup time (HTF confluence).
+      ma_sep_min      : Require |ema55 - ema100| >= ma_sep_min on the setup
+                        15M (or bias-TF) candle.
+      max_ext_pts     : At the 1M entry trigger require
+                        |entry_price - ema21| <= max_ext_pts.
+      body_frac_min   : For the setup candle require
+                        |close-open|/(high-low) >= body_frac_min.
 
     For each completed 15M bar (the "setup candle"):
         Pattern 1 (long bias):  setup is GREEN (close>open)
@@ -279,6 +318,13 @@ def detect_signals(df_1m: pd.DataFrame, df_15: pd.DataFrame,
 
     bias_arr = bias_15.values
 
+    # Optional HTF (1H) bias array, aligned to df_15.index. None = filter off.
+    bias_1h_arr = bias_1h_aligned.values if bias_1h_aligned is not None else None
+
+    # Optional MA-separation arrays from the bias-TF dataframe.
+    ema55_15 = df_15["ema55"].values if "ema55" in df_15.columns else None
+    ema100_15 = df_15["ema100"].values if "ema100" in df_15.columns else None
+
     o1 = df_1m["open"].values
     c1 = df_1m["close"].values
     h1 = df_1m["high"].values
@@ -294,6 +340,15 @@ def detect_signals(df_1m: pd.DataFrame, df_15: pd.DataFrame,
         if b == 0:
             continue
 
+        # F1: HTF (1H) confluence — 1H bias must agree with 15M bias at setup time.
+        if bias_1h_arr is not None and int(bias_1h_arr[i]) != b:
+            continue
+
+        # F2: MA separation — avoid chop where ema55 and ema100 are entwined.
+        if ma_sep_min is not None and ema55_15 is not None and ema100_15 is not None:
+            if abs(float(ema55_15[i]) - float(ema100_15[i])) < ma_sep_min:
+                continue
+
         is_green = c15[i] > o15[i]
         is_red = c15[i] < o15[i]
 
@@ -307,6 +362,15 @@ def detect_signals(df_1m: pd.DataFrame, df_15: pd.DataFrame,
         if pattern == "both" and not (is_p1 or is_p2):
             continue
         which = "P1" if is_p1 else "P2"
+
+        # F4: setup-candle body strength (filter doji-like or choppy setups).
+        if body_frac_min is not None:
+            rng = float(h15[i] - l15[i])
+            if rng <= 0:
+                continue
+            body_frac = abs(float(c15[i] - o15[i])) / rng
+            if body_frac < body_frac_min:
+                continue
 
         # Setup-candle closes at t15[i] + bias_tf_minutes; entry window is the next bias bar
         setup_close = t15[i] + pd.Timedelta(minutes=bias_tf_minutes)
@@ -336,6 +400,11 @@ def detect_signals(df_1m: pd.DataFrame, df_15: pd.DataFrame,
                 # Session filter (entry hour)
                 if session_hours is not None and t1[j].hour not in session_hours:
                     break  # setup expired this window if hour disallowed
+                # F3: extension filter — don't chase price that has already
+                # stretched far from the EMA21 mean.
+                if max_ext_pts is not None:
+                    if abs(float(c1[j]) - float(e21_1[j])) > max_ext_pts:
+                        break  # first valid trigger is too extended -> skip setup
                 # Pre-compute SL based on chosen method
                 if sl_method == "swing3m":
                     sl_lvl = latest_swing_sl(t1[j], b, df_3m, swing_high, swing_low, sl_buffer)
@@ -377,15 +446,26 @@ class Trade:
 def simulate(signals: list[Signal], df_1m: pd.DataFrame,
              rr: float,
              spread_pts: float = 0.3,
-             max_bars: int = 240) -> list[Trade]:
+             max_bars: int = 240,
+             be_at_r: Optional[float] = None,
+             trail_method: Optional[str] = None) -> list[Trade]:
     """
-    For each signal, use the pre-computed `sig.sl`, derive TP from RR x risk.
-    Walk forward bar-by-bar; if same bar hits both, assume SL first (conservative).
-    No pyramiding: skip new signals while a position is open.
+    Walk-forward simulator with optional breakeven move and trailing stop.
+
+    Parameters:
+        be_at_r: If set, when unrealized profit reaches this many R (R = initial risk),
+                 slide SL to entry (breakeven). Common values: 1.0, 1.5.
+        trail_method: After BE move, trail SL using:
+                      - "ema21" : SL clamped to current EMA21 +/- 1pt buffer
+                      - "swing" : SL clamped to most recent 1M 3-bar fractal swing
+                      - None    : no trail (just BE if be_at_r set)
+    Conservative tie-breaking: same-bar SL+TP -> SL wins.
     """
     trades: list[Trade] = []
     h = df_1m["high"].values
     l = df_1m["low"].values
+    c = df_1m["close"].values
+    e21 = df_1m["ema21"].values if "ema21" in df_1m.columns else None
     times = df_1m.index
     pos_to_idx = {t: i for i, t in enumerate(times)}
 
@@ -407,14 +487,43 @@ def simulate(signals: list[Signal], df_1m: pd.DataFrame,
             risk = sl - sig.entry
             tp = sig.entry - rr * risk
 
+        be_target = None
+        if be_at_r is not None:
+            be_target = sig.entry + be_at_r * risk if sig.direction == 1 else sig.entry - be_at_r * risk
+        be_moved = False
+
         outcome = "EOD"
         exit_price = sig.entry
         exit_time = sig.time
         bars_held = 0
+        end_idx = min(i0 + 1 + max_bars, len(df_1m))
 
-        for j in range(i0 + 1, min(i0 + 1 + max_bars, len(df_1m))):
+        for j in range(i0 + 1, end_idx):
             bar_h, bar_l = h[j], l[j]
             bars_held += 1
+
+            # 1) BE move
+            if be_target is not None and not be_moved:
+                if (sig.direction == 1 and bar_h >= be_target) or (sig.direction == -1 and bar_l <= be_target):
+                    sl = sig.entry
+                    be_moved = True
+
+            # 2) Trail update (only after BE)
+            if trail_method and be_moved and e21 is not None:
+                if trail_method == "ema21":
+                    if sig.direction == 1:
+                        sl = max(sl, float(e21[j]) - 1.0)
+                    else:
+                        sl = min(sl, float(e21[j]) + 1.0)
+                elif trail_method == "swing" and j >= 2:
+                    if sig.direction == 1:
+                        if l[j - 1] < l[j - 2] and l[j - 1] < bar_l:
+                            sl = max(sl, float(l[j - 1]) - 1.0)
+                    else:
+                        if h[j - 1] > h[j - 2] and h[j - 1] > bar_h:
+                            sl = min(sl, float(h[j - 1]) + 1.0)
+
+            # 3) Exits
             if sig.direction == 1:
                 hit_sl = bar_l <= sl
                 hit_tp = bar_h >= tp
@@ -422,13 +531,8 @@ def simulate(signals: list[Signal], df_1m: pd.DataFrame,
                 hit_sl = bar_h >= sl
                 hit_tp = bar_l <= tp
 
-            if hit_sl and hit_tp:
-                outcome = "SL"
-                exit_price = sl
-                exit_time = times[j]
-                break
             if hit_sl:
-                outcome = "SL"
+                outcome = "BE" if be_moved and abs(sl - sig.entry) < 1e-6 else "SL"
                 exit_price = sl
                 exit_time = times[j]
                 break
@@ -438,7 +542,6 @@ def simulate(signals: list[Signal], df_1m: pd.DataFrame,
                 exit_time = times[j]
                 break
         else:
-            # Didn't hit either within max_bars; close at last close
             j = min(i0 + max_bars, len(df_1m) - 1)
             exit_price = df_1m["close"].iloc[j]
             exit_time = times[j]
@@ -510,7 +613,11 @@ def run_matrix(df_lower: pd.DataFrame, df_15: pd.DataFrame,
                bias_tf_minutes: int = 15,
                rr_grid=(1.0, 1.5, 2.0, 3.0, 4.0, 5.0),
                buf_grid=(2.0, 3.0),
-               patterns=("P1", "P2", "both")) -> pd.DataFrame:
+               patterns=("P1", "P2", "both"),
+               bias_1h_aligned: Optional[pd.Series] = None,
+               ma_sep_min: Optional[float] = None,
+               max_ext_pts: Optional[float] = None,
+               body_frac_min: Optional[float] = None) -> pd.DataFrame:
     """
     df_lower: timeframe used for entry trigger (1M for Mode A, 15M for Mode B).
     df_15:    15M bars carrying bias MAs.
@@ -531,6 +638,10 @@ def run_matrix(df_lower: pd.DataFrame, df_15: pd.DataFrame,
                     df_3m=df_3m, swing_high=swing_high, swing_low=swing_low,
                     session_hours=session_hours,
                     bias_tf_minutes=bias_tf_minutes,
+                    bias_1h_aligned=bias_1h_aligned,
+                    ma_sep_min=ma_sep_min,
+                    max_ext_pts=max_ext_pts,
+                    body_frac_min=body_frac_min,
                 )
                 for rr in rr_grid:
                     trs = simulate(sigs, df_lower, rr=rr, max_bars=max_bars)
@@ -556,6 +667,129 @@ def detect_interval_minutes(df: pd.DataFrame) -> float:
     return float(diffs.median())
 
 
+def build_engine_inputs(df: pd.DataFrame, mode: str, sl_method: str,
+                        htf_confluence: bool = False,
+                        verbose: bool = True) -> dict:
+    """
+    From a raw OHLC dataframe, build everything the engine needs:
+        df_lower, df_15, df_3m, swing_high/low, wait_bars, max_bars,
+        bias_tf_minutes, bias_1h_aligned (or None).
+    Used by both the CLI here and the sweep_filters.py script so that IS / OOS
+    slices share the same construction logic.
+
+    Returns a dict of inputs plus the (possibly downgraded) sl_method.
+    """
+    iv = detect_interval_minutes(df)
+    if mode == "auto":
+        mode = "m1" if iv < 5 else "m15"
+    if verbose:
+        print(f"  mode={mode}  sl_method={sl_method}  bars={len(df):,}  iv={iv:.0f}min")
+
+    df_3m = None
+    swing_high = swing_low = None
+    bias_tf_minutes = 15
+    df_1m = None  # base 1M frame, if any
+
+    if mode == "m1":
+        df_1m = add_entry_indicators(df)
+        df_15 = add_bias_indicators(resample_15m(df_1m))
+        df_lower = df_1m
+        wait_bars = 15
+        max_bars = 240
+        if sl_method == "swing3m":
+            df_3m = resample_3m(df_1m)
+            swing_high, swing_low = find_swings_3m(df_3m)
+        elif sl_method == "swing15m":
+            df_3m = df_lower
+            swing_high, swing_low = find_swings_3m(df_lower)
+    elif mode == "m30_15":
+        bias_tf_minutes = 30
+        if iv < 5:
+            df_1m = add_entry_indicators(df)
+            df_15 = add_entry_indicators(resample_15m(df_1m))
+            df_30 = add_bias_indicators(resample_30m(df_1m))
+        else:
+            df_15 = add_entry_indicators(df)
+            df_30 = add_bias_indicators(resample_30m(df_15))
+        df_lower = df_15
+        df_15 = df_30
+        wait_bars = 2
+        max_bars = 32
+        if sl_method == "swing3m":
+            if iv < 5:
+                df_3m = resample_3m(df_1m)
+                swing_high, swing_low = find_swings_3m(df_3m)
+            else:
+                if verbose:
+                    print("  WARNING: swing3m unavailable with M15 input; using swing15m")
+                sl_method = "swing15m"
+        if sl_method == "swing15m":
+            df_3m = df_lower
+            swing_high, swing_low = find_swings_3m(df_lower)
+    else:  # m15
+        df_15 = add_bias_indicators(add_entry_indicators(df))
+        df_lower = df_15
+        wait_bars = 1
+        max_bars = 16
+        if sl_method == "swing3m":
+            if verbose:
+                print("  WARNING: swing3m unavailable in m15 mode; using ema21")
+            sl_method = "ema21"
+        if sl_method == "swing15m":
+            df_3m = df_15
+            swing_high, swing_low = find_swings_3m(df_15)
+
+    bias_1h_aligned = None
+    if htf_confluence:
+        if iv >= 60:
+            if verbose:
+                print("  WARNING: --htf-confluence requested but data interval >=60min; skipping")
+        else:
+            bias_1h_aligned = build_htf_bias_aligned(df, df_15.index, htf="1h")
+            if verbose:
+                nz = int((bias_1h_aligned != 0).sum())
+                print(f"  HTF (1H) bias aligned: nonzero={nz:,}/{len(bias_1h_aligned):,}")
+
+    return {
+        "mode": mode,
+        "sl_method": sl_method,
+        "df_lower": df_lower,
+        "df_15": df_15,
+        "df_3m": df_3m,
+        "swing_high": swing_high,
+        "swing_low": swing_low,
+        "wait_bars": wait_bars,
+        "max_bars": max_bars,
+        "bias_tf_minutes": bias_tf_minutes,
+        "bias_1h_aligned": bias_1h_aligned,
+    }
+
+
+def run_single_config(eng: dict, *, ma_combo: str, pattern: str, rr: float,
+                      sl_buf: float, session_hours: Optional[set[int]] = None,
+                      ma_sep_min: Optional[float] = None,
+                      max_ext_pts: Optional[float] = None,
+                      body_frac_min: Optional[float] = None) -> dict:
+    """
+    Run one specific config end-to-end (signals + simulate + metrics) using the
+    pre-built engine inputs `eng` from build_engine_inputs().
+    """
+    ma_cols = MA_COMBOS[ma_combo]
+    bias_15 = classify_bias(eng["df_15"], ma_cols)
+    sigs = detect_signals(
+        eng["df_lower"], eng["df_15"], bias_15,
+        pattern=pattern, wait_bars=eng["wait_bars"],
+        sl_method=eng["sl_method"], sl_buffer=sl_buf,
+        df_3m=eng["df_3m"], swing_high=eng["swing_high"], swing_low=eng["swing_low"],
+        session_hours=session_hours,
+        bias_tf_minutes=eng["bias_tf_minutes"],
+        bias_1h_aligned=eng["bias_1h_aligned"],
+        ma_sep_min=ma_sep_min, max_ext_pts=max_ext_pts, body_frac_min=body_frac_min,
+    )
+    trs = simulate(sigs, eng["df_lower"], rr=rr, max_bars=eng["max_bars"])
+    return metrics(trs)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", required=True, help="Path to OHLC CSV (M1 or M15)")
@@ -577,6 +811,26 @@ def main() -> None:
     ap.add_argument("--end", default=None, help="Optional ISO date to slice data to")
     ap.add_argument("--out", default="results.csv")
     ap.add_argument("--trades-out", default="trades_best.csv")
+
+    # ---- New optional entry filters (default OFF for backward compat) ----
+    ap.add_argument("--htf-confluence", action="store_true", default=False,
+                    help="Require 1H bias agreement with bias-TF (e.g. 15M) "
+                         "bias at setup time.")
+    ap.add_argument("--ma-sep-min", type=float, default=None,
+                    help="Min |ema55 - ema100| (gold pts) on the setup candle.")
+    ap.add_argument("--max-ext-pts", type=float, default=None,
+                    help="Max |entry_price - ema21| (pts) at the 1M entry "
+                         "trigger. Filters chases.")
+    ap.add_argument("--body-frac-min", type=float, default=None,
+                    help="Min |close-open|/(high-low) for the setup candle "
+                         "(e.g. 0.5 = body must be at least half of range).")
+
+    # ---- Train/test split (used by --report-oos here, mirrored by sweep) ----
+    ap.add_argument("--train-frac", type=float, default=0.7,
+                    help="Chronological in-sample fraction when --report-oos.")
+    ap.add_argument("--report-oos", action="store_true", default=False,
+                    help="Split data at --train-frac, run matrix on IS, "
+                         "re-run top config on OOS, print both side by side.")
     args = ap.parse_args()
 
     print(f"Loading {args.csv} ...")
@@ -588,70 +842,6 @@ def main() -> None:
     iv = detect_interval_minutes(df)
     print(f"  {len(df):,} bars from {df.index[0]} to {df.index[-1]}  median interval={iv:.0f}min")
 
-    mode = args.mode
-    if mode == "auto":
-        mode = "m1" if iv < 5 else "m15"
-    print(f"  mode = {mode}  sl_method = {args.sl_method}")
-
-    df_3m = None
-    swing_high = swing_low = None
-    bias_tf_minutes = 15
-
-    if mode == "m1":
-        df_1m = add_entry_indicators(df)
-        df_15 = add_bias_indicators(resample_15m(df_1m))
-        df_lower = df_1m
-        wait_bars = 15
-        max_bars = 240
-        if args.sl_method == "swing3m":
-            df_3m = resample_3m(df_1m)
-            swing_high, swing_low = find_swings_3m(df_3m)
-            print(f"  3M bars: {len(df_3m):,}  swings: highs={swing_high.sum():,} lows={swing_low.sum():,}")
-        elif args.sl_method == "swing15m":
-            df_3m = df_lower  # use 1M for swing detection (rare; default to swing3m)
-            swing_high, swing_low = find_swings_3m(df_lower)
-        print(f"  {len(df_15):,} 15-min bars (resampled)")
-    elif mode == "m30_15":
-        # Bias on 30M, candle theory + entry on 15M
-        bias_tf_minutes = 30
-        if iv < 5:  # M1 input -> resample to 15M and 30M
-            df_1m = add_entry_indicators(df)
-            df_15 = add_entry_indicators(resample_15m(df_1m))  # ema8/21 on 15M
-            df_30 = add_bias_indicators(resample_30m(df_1m))
-            print(f"  resampled: {len(df_15):,} 15M bars, {len(df_30):,} 30M bars (from 1M)")
-        else:  # M15 input -> resample to 30M
-            df_15 = add_entry_indicators(df)
-            df_30 = add_bias_indicators(resample_30m(df_15))
-            print(f"  {len(df_15):,} 15M bars (input), {len(df_30):,} 30M bars (resampled)")
-        df_lower = df_15
-        df_15 = df_30  # bias container is now 30M (variable kept named df_15 in engine)
-        wait_bars = 2  # next 30M = 2 15M bars
-        max_bars = 32  # ~8 hours of 15M
-
-        if args.sl_method == "swing3m":
-            if iv < 5:
-                df_3m = resample_3m(df_1m)
-                swing_high, swing_low = find_swings_3m(df_3m)
-                print(f"  3M swings: highs={swing_high.sum():,} lows={swing_low.sum():,}")
-            else:
-                print("  WARNING: 3M swing not available with M15 input; falling back to swing15m")
-                args.sl_method = "swing15m"
-        if args.sl_method == "swing15m":
-            df_3m = df_lower  # reuse the swing helper on 15M data
-            swing_high, swing_low = find_swings_3m(df_lower)
-            print(f"  15M swings: highs={swing_high.sum():,} lows={swing_low.sum():,}")
-    else:  # m15
-        df_15 = add_bias_indicators(add_entry_indicators(df))
-        df_lower = df_15
-        wait_bars = 1
-        max_bars = 16
-        if args.sl_method == "swing3m":
-            print("  WARNING: swing3m not available in m15 mode (no sub-15M data); falling back to ema21")
-            args.sl_method = "ema21"
-        if args.sl_method == "swing15m":
-            df_3m = df_15
-            swing_high, swing_low = find_swings_3m(df_15)
-
     session_hours = None
     if args.session:
         session_hours = {int(x.strip()) for x in args.session.split(",") if x.strip()}
@@ -662,13 +852,40 @@ def main() -> None:
     else:
         rr_grid, buf_grid, pats = (1.0, 1.5, 2.0, 3.0, 4.0, 5.0), (2.0, 3.0), ("P1", "P2", "both")
 
-    print(f"Running matrix ({len(MA_COMBOS) * len(pats) * len(rr_grid) * len(buf_grid)} configs) ...")
-    res = run_matrix(df_lower, df_15, wait_bars=wait_bars, max_bars=max_bars,
-                     sl_method=args.sl_method, df_3m=df_3m,
-                     swing_high=swing_high, swing_low=swing_low,
+    # Decide which slice to use as the matrix domain.
+    if args.report_oos:
+        n = len(df)
+        split = int(n * args.train_frac)
+        df_is = df.iloc[:split]
+        df_oos = df.iloc[split:]
+        print(f"  IS slice : {df_is.index[0]} -> {df_is.index[-1]}  ({len(df_is):,} bars)")
+        print(f"  OOS slice: {df_oos.index[0]} -> {df_oos.index[-1]}  ({len(df_oos):,} bars)")
+        df_for_matrix = df_is
+    else:
+        df_for_matrix = df
+
+    print("Building engine inputs ...")
+    eng = build_engine_inputs(df_for_matrix, mode=args.mode,
+                              sl_method=args.sl_method,
+                              htf_confluence=args.htf_confluence,
+                              verbose=True)
+    # Effective sl_method may have been downgraded inside build_engine_inputs.
+    args.sl_method = eng["sl_method"]
+    mode = eng["mode"]
+
+    n_configs = len(MA_COMBOS) * len(pats) * len(rr_grid) * len(buf_grid)
+    print(f"Running matrix ({n_configs} configs) ...")
+    res = run_matrix(eng["df_lower"], eng["df_15"],
+                     wait_bars=eng["wait_bars"], max_bars=eng["max_bars"],
+                     sl_method=eng["sl_method"], df_3m=eng["df_3m"],
+                     swing_high=eng["swing_high"], swing_low=eng["swing_low"],
                      session_hours=session_hours,
-                     bias_tf_minutes=bias_tf_minutes,
-                     rr_grid=rr_grid, buf_grid=buf_grid, patterns=pats)
+                     bias_tf_minutes=eng["bias_tf_minutes"],
+                     rr_grid=rr_grid, buf_grid=buf_grid, patterns=pats,
+                     bias_1h_aligned=eng["bias_1h_aligned"],
+                     ma_sep_min=args.ma_sep_min,
+                     max_ext_pts=args.max_ext_pts,
+                     body_frac_min=args.body_frac_min)
     res["mode"] = mode
     res["sl_method"] = args.sl_method
     res.to_csv(args.out, index=False, float_format="%.3f")
@@ -677,17 +894,50 @@ def main() -> None:
     print(res.head(15).to_string(index=False))
 
     best = res.iloc[0]
-    ma_cols = MA_COMBOS[best["ma_combo"]]
-    bias_15 = classify_bias(df_15, ma_cols)
-    sigs = detect_signals(df_lower, df_15, bias_15,
-                          pattern=best["pattern"], wait_bars=wait_bars,
-                          sl_method=args.sl_method, sl_buffer=best["sl_buf"],
-                          df_3m=df_3m, swing_high=swing_high, swing_low=swing_low,
-                          session_hours=session_hours,
-                          bias_tf_minutes=bias_tf_minutes)
-    trs = simulate(sigs, df_lower, rr=best["rr"], max_bars=max_bars)
+    sigs = detect_signals(
+        eng["df_lower"], eng["df_15"],
+        classify_bias(eng["df_15"], MA_COMBOS[best["ma_combo"]]),
+        pattern=best["pattern"], wait_bars=eng["wait_bars"],
+        sl_method=eng["sl_method"], sl_buffer=best["sl_buf"],
+        df_3m=eng["df_3m"], swing_high=eng["swing_high"], swing_low=eng["swing_low"],
+        session_hours=session_hours,
+        bias_tf_minutes=eng["bias_tf_minutes"],
+        bias_1h_aligned=eng["bias_1h_aligned"],
+        ma_sep_min=args.ma_sep_min, max_ext_pts=args.max_ext_pts,
+        body_frac_min=args.body_frac_min,
+    )
+    trs = simulate(sigs, eng["df_lower"], rr=best["rr"], max_bars=eng["max_bars"])
     pd.DataFrame([t.__dict__ for t in trs]).to_csv(args.trades_out, index=False)
     print(f"Best config trade log -> {args.trades_out}")
+
+    # ---- Optional OOS verification of top-1 IS config ----
+    if args.report_oos:
+        print("\n" + "=" * 70)
+        print("OOS verification of top-1 IS config")
+        print("=" * 70)
+        eng_oos = build_engine_inputs(df_oos, mode=args.mode,
+                                      sl_method=args.sl_method,
+                                      htf_confluence=args.htf_confluence,
+                                      verbose=True)
+        oos_m = run_single_config(
+            eng_oos,
+            ma_combo=best["ma_combo"], pattern=best["pattern"],
+            rr=float(best["rr"]), sl_buf=float(best["sl_buf"]),
+            session_hours=session_hours,
+            ma_sep_min=args.ma_sep_min, max_ext_pts=args.max_ext_pts,
+            body_frac_min=args.body_frac_min,
+        )
+        print(f"\nConfig: ma_combo={best['ma_combo']}  pattern={best['pattern']}  "
+              f"rr={best['rr']}  sl_buf={best['sl_buf']}")
+        print(f"  IS : trades={int(best['trades'])}  WR={best['win_rate']:.1f}%  "
+              f"net={best['net_pts']:.1f}  PF={best['profit_factor']:.2f}  "
+              f"DD={best['max_dd_pts']:.1f}")
+        if oos_m.get("trades", 0) > 0:
+            print(f"  OOS: trades={oos_m['trades']}  WR={oos_m['win_rate']:.1f}%  "
+                  f"net={oos_m['net_pts']:.1f}  PF={oos_m['profit_factor']:.2f}  "
+                  f"DD={oos_m['max_dd_pts']:.1f}")
+        else:
+            print("  OOS: no trades")
 
 
 if __name__ == "__main__":
