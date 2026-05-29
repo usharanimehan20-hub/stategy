@@ -31,32 +31,36 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 
 def load_csv(path: str, tz: Optional[str] = None) -> pd.DataFrame:
-    """Load 1-minute OHLC CSV with flexible column naming."""
-    df = pd.read_csv(path)
-    df.columns = [c.strip().lower() for c in df.columns]
+    """
+    Load OHLC CSV with flexible format. Supports:
+      - Comma-separated with timestamp column
+      - MetaTrader TSV with <DATE> <TIME> <OPEN> <HIGH> <LOW> <CLOSE> ...
+      - Either separate date/time or single timestamp
+    """
+    # Auto-detect separator: try tab first (MetaTrader), then comma
+    with open(path, "r") as fh:
+        first = fh.readline()
+    sep = "\t" if "\t" in first else ","
+    df = pd.read_csv(path, sep=sep)
 
-    # Find timestamp column
-    ts_col = next((c for c in df.columns
-                   if c in ("timestamp", "time", "date", "datetime", "<date>", "<time>")),
-                  None)
-    if ts_col is None:
-        # Try combining date + time
-        if "date" in df.columns and "time" in df.columns:
-            df["timestamp"] = pd.to_datetime(df["date"].astype(str) + " " + df["time"].astype(str))
-        else:
-            raise ValueError(f"Could not find a timestamp column in {df.columns.tolist()}")
+    # Strip angle brackets and lowercase
+    df.columns = [c.strip().strip("<>").lower() for c in df.columns]
+
+    # Build timestamp
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+    elif "datetime" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["datetime"])
+    elif "date" in df.columns and "time" in df.columns:
+        # MetaTrader format: 2026.02.16 + 05:16:00
+        date_str = df["date"].astype(str).str.replace(".", "-", regex=False)
+        df["timestamp"] = pd.to_datetime(date_str + " " + df["time"].astype(str))
+    elif "date" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["date"])
     else:
-        df["timestamp"] = pd.to_datetime(df[ts_col])
+        raise ValueError(f"Could not derive a timestamp from columns: {df.columns.tolist()}")
 
-    # OHLC
-    rename = {}
-    for want in ("open", "high", "low", "close"):
-        for cand in (want, f"<{want}>"):
-            if cand in df.columns:
-                rename[cand] = want
-                break
-    df = df.rename(columns=rename)
-
+    # OHLC columns are already lowercased without brackets
     missing = {"open", "high", "low", "close"} - set(df.columns)
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
@@ -406,18 +410,29 @@ def metrics(trades: list[Trade]) -> dict:
 # 7. Matrix runner
 # ---------------------------------------------------------------------------
 
-def run_matrix(df_1m: pd.DataFrame, df_15: pd.DataFrame,
+def run_matrix(df_lower: pd.DataFrame, df_15: pd.DataFrame,
+               wait_bars: int, max_bars: int,
                rr_grid=(1.0, 1.5, 2.0, 3.0, 4.0, 5.0),
                buf_grid=(2.0, 3.0),
                patterns=("P1", "P2", "both")) -> pd.DataFrame:
+    """
+    df_lower: timeframe used for entry trigger (1M for Mode A, 15M for Mode B).
+              Must contain ema8, ema21 columns.
+    df_15:    15M bars carrying bias MAs.
+    wait_bars: how many df_lower bars after a 15M setup-candle close to wait
+               for an entry trigger. (15 for Mode A, 1 for Mode B.)
+    max_bars: max df_lower bars to hold a trade before timing out.
+    """
     rows = []
     for combo_name, ma_cols in MA_COMBOS.items():
         bias_15 = classify_bias(df_15, ma_cols)
 
         for pat in patterns:
-            sigs = detect_signals(df_1m, df_15, bias_15, pattern=pat)
+            sigs = detect_signals(df_lower, df_15, bias_15,
+                                  pattern=pat, wait_bars=wait_bars)
             for rr, buf in itertools.product(rr_grid, buf_grid):
-                trs = simulate(sigs, df_1m, rr=rr, sl_buffer=buf)
+                trs = simulate(sigs, df_lower, rr=rr, sl_buffer=buf,
+                               max_bars=max_bars)
                 m = metrics(trs)
                 m.update({"ma_combo": combo_name, "pattern": pat,
                           "rr": rr, "sl_buf": buf})
@@ -434,42 +449,78 @@ def run_matrix(df_1m: pd.DataFrame, df_15: pd.DataFrame,
 # 8. CLI
 # ---------------------------------------------------------------------------
 
+def detect_interval_minutes(df: pd.DataFrame) -> float:
+    """Median bar interval in minutes (robust to weekend gaps)."""
+    diffs = df.index.to_series().diff().dt.total_seconds().dropna() / 60
+    return float(diffs.median())
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--csv", required=True, help="Path to 1-min XAUUSD CSV")
+    ap.add_argument("--csv", required=True, help="Path to OHLC CSV (M1 or M15)")
+    ap.add_argument("--mode", choices=("auto", "m1", "m15"), default="auto",
+                    help="m1 = setup on 15M (resampled), trigger on 1M; "
+                         "m15 = everything on 15M; auto detects from data")
     ap.add_argument("--tz", default=None, help="Optional timezone localization")
     ap.add_argument("--quick", action="store_true",
                     help="Use a smaller matrix for fast smoke test")
+    ap.add_argument("--start", default=None,
+                    help="Optional ISO date to slice data from (e.g. 2026-02-16)")
+    ap.add_argument("--end", default=None, help="Optional ISO date to slice data to")
     ap.add_argument("--out", default="results.csv")
     ap.add_argument("--trades-out", default="trades_best.csv")
     args = ap.parse_args()
 
     print(f"Loading {args.csv} ...")
-    df_1m = load_csv(args.csv, tz=args.tz)
-    print(f"  {len(df_1m):,} 1-min bars from {df_1m.index[0]} to {df_1m.index[-1]}")
+    df = load_csv(args.csv, tz=args.tz)
+    if args.start:
+        df = df[df.index >= pd.Timestamp(args.start)]
+    if args.end:
+        df = df[df.index <= pd.Timestamp(args.end)]
+    iv = detect_interval_minutes(df)
+    print(f"  {len(df):,} bars from {df.index[0]} to {df.index[-1]}  median interval={iv:.0f}min")
 
-    df_1m = add_entry_indicators(df_1m)
-    df_15 = add_bias_indicators(resample_15m(df_1m))
-    print(f"  {len(df_15):,} 15-min bars")
+    # Resolve mode
+    mode = args.mode
+    if mode == "auto":
+        mode = "m1" if iv < 5 else "m15"
+    print(f"  mode = {mode}")
+
+    if mode == "m1":
+        df_1m = add_entry_indicators(df)
+        df_15 = add_bias_indicators(resample_15m(df_1m))
+        df_lower = df_1m
+        wait_bars = 15
+        max_bars = 240          # ~4 hours
+        print(f"  {len(df_15):,} 15-min bars (resampled)")
+    else:  # m15
+        df_15 = add_bias_indicators(add_entry_indicators(df))
+        df_lower = df_15        # entry trigger uses 15M itself
+        wait_bars = 1
+        max_bars = 16           # ~4 hours
 
     if args.quick:
         rr_grid, buf_grid, pats = (1.0, 2.0, 3.0), (2.0,), ("both",)
     else:
         rr_grid, buf_grid, pats = (1.0, 1.5, 2.0, 3.0, 4.0, 5.0), (2.0, 3.0), ("P1", "P2", "both")
 
-    print("Running matrix ...")
-    res = run_matrix(df_1m, df_15, rr_grid=rr_grid, buf_grid=buf_grid, patterns=pats)
+    print(f"Running matrix ({len(MA_COMBOS) * len(pats) * len(rr_grid) * len(buf_grid)} configs) ...")
+    res = run_matrix(df_lower, df_15, wait_bars=wait_bars, max_bars=max_bars,
+                     rr_grid=rr_grid, buf_grid=buf_grid, patterns=pats)
+    res["mode"] = mode
     res.to_csv(args.out, index=False, float_format="%.3f")
     print(f"\nSaved {len(res)} configs -> {args.out}")
     print("\nTop 15 by net points:")
     print(res.head(15).to_string(index=False))
 
-    # Re-simulate the single best config to dump trade-level CSV
+    # Re-simulate the best config to dump trade-level CSV
     best = res.iloc[0]
     ma_cols = MA_COMBOS[best["ma_combo"]]
     bias_15 = classify_bias(df_15, ma_cols)
-    sigs = detect_signals(df_1m, df_15, bias_15, pattern=best["pattern"])
-    trs = simulate(sigs, df_1m, rr=best["rr"], sl_buffer=best["sl_buf"])
+    sigs = detect_signals(df_lower, df_15, bias_15,
+                          pattern=best["pattern"], wait_bars=wait_bars)
+    trs = simulate(sigs, df_lower, rr=best["rr"],
+                   sl_buffer=best["sl_buf"], max_bars=max_bars)
     pd.DataFrame([t.__dict__ for t in trs]).to_csv(args.trades_out, index=False)
     print(f"Best config trade log -> {args.trades_out}")
 

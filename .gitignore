@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 .venv/
 venv/
-results.csv
-trades_best.csv
 *.log
+
+# Smoke-test scratch files (generic names)
+_q_*.csv
