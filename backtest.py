@@ -1,0 +1,478 @@
+"""
+Gold (XAUUSD) — Multi-MA Bias + Candle Theory Backtester
+=========================================================
+
+Strategy: see STRATEGY.md
+
+Usage:
+    python3 backtest.py --csv path/to/xauusd_1m.csv
+    python3 backtest.py --csv path/to/xauusd_1m.csv --tz UTC
+    python3 backtest.py --csv path/to/xauusd_1m.csv --quick   # smaller matrix
+
+CSV expected columns (case-insensitive):
+    timestamp (or time/date/datetime), open, high, low, close
+
+The 15-minute bias series is built internally by resampling the 1-min data.
+"""
+
+from __future__ import annotations
+import argparse
+import itertools
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+
+
+# ---------------------------------------------------------------------------
+# 1. Data loading
+# ---------------------------------------------------------------------------
+
+def load_csv(path: str, tz: Optional[str] = None) -> pd.DataFrame:
+    """Load 1-minute OHLC CSV with flexible column naming."""
+    df = pd.read_csv(path)
+    df.columns = [c.strip().lower() for c in df.columns]
+
+    # Find timestamp column
+    ts_col = next((c for c in df.columns
+                   if c in ("timestamp", "time", "date", "datetime", "<date>", "<time>")),
+                  None)
+    if ts_col is None:
+        # Try combining date + time
+        if "date" in df.columns and "time" in df.columns:
+            df["timestamp"] = pd.to_datetime(df["date"].astype(str) + " " + df["time"].astype(str))
+        else:
+            raise ValueError(f"Could not find a timestamp column in {df.columns.tolist()}")
+    else:
+        df["timestamp"] = pd.to_datetime(df[ts_col])
+
+    # OHLC
+    rename = {}
+    for want in ("open", "high", "low", "close"):
+        for cand in (want, f"<{want}>"):
+            if cand in df.columns:
+                rename[cand] = want
+                break
+    df = df.rename(columns=rename)
+
+    missing = {"open", "high", "low", "close"} - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+
+    df = df[["timestamp", "open", "high", "low", "close"]].copy()
+    df = df.sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
+    df = df.set_index("timestamp")
+
+    if tz:
+        if df.index.tz is None:
+            df.index = df.index.tz_localize(tz)
+        else:
+            df.index = df.index.tz_convert(tz)
+
+    return df
+
+
+def resample_15m(df_1m: pd.DataFrame) -> pd.DataFrame:
+    """Resample 1-min OHLC to 15-min OHLC."""
+    agg = {"open": "first", "high": "max", "low": "min", "close": "last"}
+    df_15 = df_1m.resample("15min", label="left", closed="left").agg(agg).dropna()
+    return df_15
+
+
+# ---------------------------------------------------------------------------
+# 2. Indicators
+# ---------------------------------------------------------------------------
+
+def wma(s: pd.Series, length: int) -> pd.Series:
+    weights = np.arange(1, length + 1, dtype=float)
+    return s.rolling(length).apply(lambda x: np.dot(x, weights) / weights.sum(), raw=True)
+
+
+def ema(s: pd.Series, length: int) -> pd.Series:
+    return s.ewm(span=length, adjust=False).mean()
+
+
+def add_bias_indicators(df_15: pd.DataFrame) -> pd.DataFrame:
+    out = df_15.copy()
+    out["wma34"] = wma(out["close"], 34)
+    out["wma64"] = wma(out["close"], 64)
+    out["ema55"] = ema(out["close"], 55)
+    out["ema100"] = ema(out["close"], 100)
+    return out
+
+
+def add_entry_indicators(df_1m: pd.DataFrame) -> pd.DataFrame:
+    out = df_1m.copy()
+    out["ema8"] = ema(out["close"], 8)
+    out["ema21"] = ema(out["close"], 21)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 3. Bias classification
+# ---------------------------------------------------------------------------
+
+# MA combos to test
+MA_COMBOS = {
+    "ribbon_only":          ("wma34", "wma64"),
+    "ribbon_ema55":         ("wma34", "wma64", "ema55"),
+    "ribbon_ema100":        ("wma34", "wma64", "ema100"),
+    "ribbon_ema55_ema100":  ("wma34", "wma64", "ema55", "ema100"),  # full setup
+}
+
+
+def classify_bias(df_15: pd.DataFrame, ma_cols: tuple[str, ...]) -> pd.Series:
+    """
+    Returns a series of {1, -1, 0} per 15M bar:
+        +1 = bullish (close strictly above all MAs in combo)
+        -1 = bearish (close strictly below all MAs in combo)
+         0 = mixed / no bias
+
+    Bias **persists** until invalidated by an opposite-direction qualifying close.
+    """
+    close = df_15["close"]
+    above = pd.concat([close > df_15[c] for c in ma_cols], axis=1).all(axis=1)
+    below = pd.concat([close < df_15[c] for c in ma_cols], axis=1).all(axis=1)
+
+    raw = pd.Series(0, index=df_15.index, dtype=int)
+    raw[above] = 1
+    raw[below] = -1
+
+    # Persist last non-zero bias
+    bias = raw.replace(0, np.nan).ffill().fillna(0).astype(int)
+    return bias
+
+
+def project_bias_to_1m(bias_15: pd.Series, df_1m: pd.DataFrame) -> pd.Series:
+    """
+    For each 1-min bar, the active bias = bias of the LAST CLOSED 15M bar.
+    A 15M bar at time T closes at T+15min, so its bias is available from T+15min onwards.
+    """
+    bias_avail = bias_15.copy()
+    bias_avail.index = bias_avail.index + pd.Timedelta(minutes=15)
+    aligned = bias_avail.reindex(df_1m.index, method="ffill").fillna(0).astype(int)
+    return aligned
+
+
+# ---------------------------------------------------------------------------
+# 4. Entry detection (Candle Theory)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Signal:
+    time: pd.Timestamp
+    direction: int       # +1 long, -1 short
+    entry: float         # entry price (close of confirmation candle)
+    pattern: str         # "P1" or "P2"
+    ema21_at_entry: float
+
+
+def detect_signals(df_1m: pd.DataFrame, df_15: pd.DataFrame,
+                   bias_15: pd.Series, pattern: str = "both",
+                   wait_bars: int = 15) -> list[Signal]:
+    """
+    Candle Theory — setup on 15M, entry trigger on 1M.
+
+    For each completed 15M bar (the "setup candle"):
+        Pattern 1 (long bias):  setup is GREEN (close>open)
+                                during next 15M window watch 1-min bars
+                                first 1M with (close>open) AND (close>prev_1M_close) -> ENTRY
+        Pattern 2 (long bias):  setup is RED (close<open)
+                                during next 15M window watch 1-min bars
+                                a 1M HIGH must first break the setup candle's HIGH
+                                then first 1M with (close>open) AND (close>prev_1M_close) -> ENTRY
+                                (break and body-close can be the same 1M bar)
+        Bearish bias = mirror.
+
+    `wait_bars` = number of 1-min bars after setup-candle close during which the
+                  setup remains armed. Default 15 = exactly the next 15M window.
+    """
+    o15 = df_15["open"].values
+    c15 = df_15["close"].values
+    h15 = df_15["high"].values
+    l15 = df_15["low"].values
+    t15 = df_15.index
+
+    bias_arr = bias_15.values
+
+    o1 = df_1m["open"].values
+    c1 = df_1m["close"].values
+    h1 = df_1m["high"].values
+    l1 = df_1m["low"].values
+    e21_1 = df_1m["ema21"].values
+    t1 = df_1m.index
+    pos1 = {t: i for i, t in enumerate(t1)}
+
+    signals: list[Signal] = []
+
+    for i in range(len(df_15) - 1):
+        b = int(bias_arr[i])
+        if b == 0:
+            continue
+
+        is_green = c15[i] > o15[i]
+        is_red = c15[i] < o15[i]
+
+        is_p1 = (b == 1 and is_green) or (b == -1 and is_red)
+        is_p2 = (b == 1 and is_red) or (b == -1 and is_green)
+
+        if pattern == "P1" and not is_p1:
+            continue
+        if pattern == "P2" and not is_p2:
+            continue
+        if pattern == "both" and not (is_p1 or is_p2):
+            continue
+        which = "P1" if is_p1 else "P2"
+
+        # Setup-candle closes at t15[i] + 15min; entry window is the next 15M
+        setup_close = t15[i] + pd.Timedelta(minutes=15)
+        start_idx = pos1.get(setup_close)
+        if start_idx is None:
+            continue
+        end_idx = min(start_idx + wait_bars, len(df_1m))
+
+        # For P2, find the high/low break first
+        scan_start = start_idx
+        if which == "P2":
+            target = h15[i] if b == 1 else l15[i]
+            broke_at = None
+            for j in range(start_idx, end_idx):
+                if (b == 1 and h1[j] > target) or (b == -1 and l1[j] < target):
+                    broke_at = j
+                    break
+            if broke_at is None:
+                continue
+            scan_start = broke_at  # break and body-close may be same bar
+
+        # First 1M body close in bias direction with BOS (close vs prev close)
+        for j in range(max(scan_start, 1), end_idx):
+            body_ok = (b == 1 and c1[j] > o1[j]) or (b == -1 and c1[j] < o1[j])
+            bos_ok = (b == 1 and c1[j] > c1[j - 1]) or (b == -1 and c1[j] < c1[j - 1])
+            if body_ok and bos_ok:
+                signals.append(Signal(
+                    time=t1[j], direction=b, entry=float(c1[j]),
+                    pattern=which, ema21_at_entry=float(e21_1[j]),
+                ))
+                break  # one entry per setup
+    return signals
+
+
+# ---------------------------------------------------------------------------
+# 5. Trade simulation
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Trade:
+    entry_time: pd.Timestamp
+    exit_time: pd.Timestamp
+    direction: int
+    pattern: str
+    entry: float
+    sl: float
+    tp: float
+    exit_price: float
+    pnl_points: float
+    bars_held: int
+    outcome: str  # "TP", "SL", "EOD"
+
+
+def simulate(signals: list[Signal], df_1m: pd.DataFrame,
+             rr: float, sl_buffer: float,
+             spread_pts: float = 0.3,
+             max_bars: int = 240) -> list[Trade]:
+    """
+    For each signal, set SL = EMA21 ± buffer, TP = entry ± rr * SL_distance.
+    Walk forward bar-by-bar; if same bar hits both, assume SL first (conservative).
+    No pyramiding: skip new signals while a position is open.
+    """
+    trades: list[Trade] = []
+    h = df_1m["high"].values
+    l = df_1m["low"].values
+    times = df_1m.index
+    pos_to_idx = {t: i for i, t in enumerate(times)}
+
+    busy_until = -1
+    for sig in signals:
+        i0 = pos_to_idx.get(sig.time)
+        if i0 is None or i0 < busy_until:
+            continue
+
+        # Stop placement
+        if sig.direction == 1:
+            sl = sig.ema21_at_entry - sl_buffer
+            if sl >= sig.entry:  # malformed; skip
+                continue
+            risk = sig.entry - sl
+            tp = sig.entry + rr * risk
+        else:
+            sl = sig.ema21_at_entry + sl_buffer
+            if sl <= sig.entry:
+                continue
+            risk = sl - sig.entry
+            tp = sig.entry - rr * risk
+
+        outcome = "EOD"
+        exit_price = sig.entry
+        exit_time = sig.time
+        bars_held = 0
+
+        for j in range(i0 + 1, min(i0 + 1 + max_bars, len(df_1m))):
+            bar_h, bar_l = h[j], l[j]
+            bars_held += 1
+            if sig.direction == 1:
+                hit_sl = bar_l <= sl
+                hit_tp = bar_h >= tp
+            else:
+                hit_sl = bar_h >= sl
+                hit_tp = bar_l <= tp
+
+            if hit_sl and hit_tp:
+                outcome = "SL"
+                exit_price = sl
+                exit_time = times[j]
+                break
+            if hit_sl:
+                outcome = "SL"
+                exit_price = sl
+                exit_time = times[j]
+                break
+            if hit_tp:
+                outcome = "TP"
+                exit_price = tp
+                exit_time = times[j]
+                break
+        else:
+            # Didn't hit either within max_bars; close at last close
+            j = min(i0 + max_bars, len(df_1m) - 1)
+            exit_price = df_1m["close"].iloc[j]
+            exit_time = times[j]
+
+        if sig.direction == 1:
+            pnl = exit_price - sig.entry - spread_pts
+        else:
+            pnl = sig.entry - exit_price - spread_pts
+
+        trades.append(Trade(
+            entry_time=sig.time, exit_time=exit_time, direction=sig.direction,
+            pattern=sig.pattern, entry=sig.entry, sl=sl, tp=tp,
+            exit_price=exit_price, pnl_points=pnl, bars_held=bars_held,
+            outcome=outcome,
+        ))
+        busy_until = pos_to_idx.get(exit_time, i0 + bars_held) + 1
+
+    return trades
+
+
+# ---------------------------------------------------------------------------
+# 6. Metrics
+# ---------------------------------------------------------------------------
+
+def metrics(trades: list[Trade]) -> dict:
+    if not trades:
+        return {"trades": 0}
+    pnl = np.array([t.pnl_points for t in trades])
+    wins = pnl[pnl > 0]
+    losses = pnl[pnl <= 0]
+    gross_w = wins.sum() if len(wins) else 0.0
+    gross_l = -losses.sum() if len(losses) else 0.0
+
+    # Equity curve & drawdown
+    eq = np.cumsum(pnl)
+    peak = np.maximum.accumulate(eq)
+    dd = peak - eq
+    max_dd = dd.max() if len(dd) else 0.0
+
+    days = (trades[-1].exit_time - trades[0].entry_time).total_seconds() / 86400
+    tpd = len(trades) / max(days, 1e-9)
+
+    return {
+        "trades": len(trades),
+        "win_rate": len(wins) / len(trades) * 100,
+        "net_pts": pnl.sum(),
+        "avg_trade_pts": pnl.mean(),
+        "profit_factor": (gross_w / gross_l) if gross_l > 0 else float("inf"),
+        "max_dd_pts": max_dd,
+        "trades_per_day": tpd,
+        "tp_rate": sum(1 for t in trades if t.outcome == "TP") / len(trades) * 100,
+        "sl_rate": sum(1 for t in trades if t.outcome == "SL") / len(trades) * 100,
+        "p1_share": sum(1 for t in trades if t.pattern == "P1") / len(trades) * 100,
+        "p2_share": sum(1 for t in trades if t.pattern == "P2") / len(trades) * 100,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 7. Matrix runner
+# ---------------------------------------------------------------------------
+
+def run_matrix(df_1m: pd.DataFrame, df_15: pd.DataFrame,
+               rr_grid=(1.0, 1.5, 2.0, 3.0, 4.0, 5.0),
+               buf_grid=(2.0, 3.0),
+               patterns=("P1", "P2", "both")) -> pd.DataFrame:
+    rows = []
+    for combo_name, ma_cols in MA_COMBOS.items():
+        bias_15 = classify_bias(df_15, ma_cols)
+
+        for pat in patterns:
+            sigs = detect_signals(df_1m, df_15, bias_15, pattern=pat)
+            for rr, buf in itertools.product(rr_grid, buf_grid):
+                trs = simulate(sigs, df_1m, rr=rr, sl_buffer=buf)
+                m = metrics(trs)
+                m.update({"ma_combo": combo_name, "pattern": pat,
+                          "rr": rr, "sl_buf": buf})
+                rows.append(m)
+    df = pd.DataFrame(rows)
+    cols = ["ma_combo", "pattern", "rr", "sl_buf",
+            "trades", "win_rate", "tp_rate", "sl_rate",
+            "net_pts", "avg_trade_pts", "profit_factor", "max_dd_pts",
+            "trades_per_day", "p1_share", "p2_share"]
+    return df[cols].sort_values("net_pts", ascending=False).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# 8. CLI
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--csv", required=True, help="Path to 1-min XAUUSD CSV")
+    ap.add_argument("--tz", default=None, help="Optional timezone localization")
+    ap.add_argument("--quick", action="store_true",
+                    help="Use a smaller matrix for fast smoke test")
+    ap.add_argument("--out", default="results.csv")
+    ap.add_argument("--trades-out", default="trades_best.csv")
+    args = ap.parse_args()
+
+    print(f"Loading {args.csv} ...")
+    df_1m = load_csv(args.csv, tz=args.tz)
+    print(f"  {len(df_1m):,} 1-min bars from {df_1m.index[0]} to {df_1m.index[-1]}")
+
+    df_1m = add_entry_indicators(df_1m)
+    df_15 = add_bias_indicators(resample_15m(df_1m))
+    print(f"  {len(df_15):,} 15-min bars")
+
+    if args.quick:
+        rr_grid, buf_grid, pats = (1.0, 2.0, 3.0), (2.0,), ("both",)
+    else:
+        rr_grid, buf_grid, pats = (1.0, 1.5, 2.0, 3.0, 4.0, 5.0), (2.0, 3.0), ("P1", "P2", "both")
+
+    print("Running matrix ...")
+    res = run_matrix(df_1m, df_15, rr_grid=rr_grid, buf_grid=buf_grid, patterns=pats)
+    res.to_csv(args.out, index=False, float_format="%.3f")
+    print(f"\nSaved {len(res)} configs -> {args.out}")
+    print("\nTop 15 by net points:")
+    print(res.head(15).to_string(index=False))
+
+    # Re-simulate the single best config to dump trade-level CSV
+    best = res.iloc[0]
+    ma_cols = MA_COMBOS[best["ma_combo"]]
+    bias_15 = classify_bias(df_15, ma_cols)
+    sigs = detect_signals(df_1m, df_15, bias_15, pattern=best["pattern"])
+    trs = simulate(sigs, df_1m, rr=best["rr"], sl_buffer=best["sl_buf"])
+    pd.DataFrame([t.__dict__ for t in trs]).to_csv(args.trades_out, index=False)
+    print(f"Best config trade log -> {args.trades_out}")
+
+
+if __name__ == "__main__":
+    main()
