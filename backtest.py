@@ -448,7 +448,9 @@ def simulate(signals: list[Signal], df_1m: pd.DataFrame,
              spread_pts: float = 0.3,
              max_bars: int = 240,
              be_at_r: Optional[float] = None,
-             trail_method: Optional[str] = None) -> list[Trade]:
+             trail_method: Optional[str] = None,
+             tp1_at_r: Optional[float] = None,
+             tp1_close_frac: float = 0.5) -> list[Trade]:
     """
     Walk-forward simulator with optional breakeven move and trailing stop.
 
@@ -481,16 +483,23 @@ def simulate(signals: list[Signal], df_1m: pd.DataFrame,
                 continue
             risk = sig.entry - sl
             tp = sig.entry + rr * risk
+            tp1 = sig.entry + tp1_at_r * risk if tp1_at_r is not None else None
         else:
             if sl <= sig.entry:
                 continue
             risk = sl - sig.entry
             tp = sig.entry - rr * risk
+            tp1 = sig.entry - tp1_at_r * risk if tp1_at_r is not None else None
 
         be_target = None
         if be_at_r is not None:
             be_target = sig.entry + be_at_r * risk if sig.direction == 1 else sig.entry - be_at_r * risk
         be_moved = False
+
+        # Scale-out state
+        tp1_hit = False
+        locked_pnl = 0.0
+        remain_frac = 1.0
 
         outcome = "EOD"
         exit_price = sig.entry
@@ -502,13 +511,24 @@ def simulate(signals: list[Signal], df_1m: pd.DataFrame,
             bar_h, bar_l = h[j], l[j]
             bars_held += 1
 
-            # 1) BE move
-            if be_target is not None and not be_moved:
+            # 1) TP1 partial close (scale-out)
+            if tp1 is not None and not tp1_hit:
+                tp1_reached = (sig.direction == 1 and bar_h >= tp1) or (sig.direction == -1 and bar_l <= tp1)
+                if tp1_reached:
+                    pnl_per_unit = (tp1 - sig.entry) if sig.direction == 1 else (sig.entry - tp1)
+                    locked_pnl += tp1_close_frac * pnl_per_unit
+                    remain_frac -= tp1_close_frac
+                    sl = sig.entry  # runner SL -> BE
+                    tp1_hit = True
+                    be_moved = True
+
+            # 2) BE move (single-target path)
+            if tp1 is None and be_target is not None and not be_moved:
                 if (sig.direction == 1 and bar_h >= be_target) or (sig.direction == -1 and bar_l <= be_target):
                     sl = sig.entry
                     be_moved = True
 
-            # 2) Trail update (only after BE)
+            # 3) Trail update (after BE)
             if trail_method and be_moved and e21 is not None:
                 if trail_method == "ema21":
                     if sig.direction == 1:
@@ -523,7 +543,7 @@ def simulate(signals: list[Signal], df_1m: pd.DataFrame,
                         if h[j - 1] > h[j - 2] and h[j - 1] > bar_h:
                             sl = min(sl, float(h[j - 1]) + 1.0)
 
-            # 3) Exits
+            # 4) Exits
             if sig.direction == 1:
                 hit_sl = bar_l <= sl
                 hit_tp = bar_h >= tp
@@ -531,30 +551,35 @@ def simulate(signals: list[Signal], df_1m: pd.DataFrame,
                 hit_sl = bar_h >= sl
                 hit_tp = bar_l <= tp
 
-            if hit_sl:
-                outcome = "BE" if be_moved and abs(sl - sig.entry) < 1e-6 else "SL"
-                exit_price = sl
-                exit_time = times[j]
-                break
-            if hit_tp:
-                outcome = "TP"
-                exit_price = tp
+            if hit_sl or hit_tp:
+                exit_p = sl if hit_sl else tp
+                pnl_per_unit = (exit_p - sig.entry) if sig.direction == 1 else (sig.entry - exit_p)
+                runner_pnl = remain_frac * pnl_per_unit
+                total = locked_pnl + runner_pnl - spread_pts
+                if hit_tp:
+                    outcome = "TP2" if tp1_hit else "TP"
+                else:
+                    if tp1_hit:
+                        outcome = "BE_after_TP1" if abs(exit_p - sig.entry) < 1e-6 else "TP1+SL"
+                    else:
+                        outcome = "BE" if be_moved and abs(sl - sig.entry) < 1e-6 else "SL"
+                exit_price = exit_p
                 exit_time = times[j]
                 break
         else:
             j = min(i0 + max_bars, len(df_1m) - 1)
-            exit_price = df_1m["close"].iloc[j]
+            exit_p = float(df_1m["close"].iloc[j])
+            pnl_per_unit = (exit_p - sig.entry) if sig.direction == 1 else (sig.entry - exit_p)
+            runner_pnl = remain_frac * pnl_per_unit
+            total = locked_pnl + runner_pnl - spread_pts
+            exit_price = exit_p
             exit_time = times[j]
-
-        if sig.direction == 1:
-            pnl = exit_price - sig.entry - spread_pts
-        else:
-            pnl = sig.entry - exit_price - spread_pts
+            outcome = "TP1+EOD" if tp1_hit else "EOD"
 
         trades.append(Trade(
             entry_time=sig.time, exit_time=exit_time, direction=sig.direction,
             pattern=sig.pattern, entry=sig.entry, sl=sl, tp=tp,
-            exit_price=exit_price, pnl_points=pnl, bars_held=bars_held,
+            exit_price=exit_price, pnl_points=total, bars_held=bars_held,
             outcome=outcome,
         ))
         busy_until = pos_to_idx.get(exit_time, i0 + bars_held) + 1
