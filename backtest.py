@@ -85,6 +85,12 @@ def resample_15m(df_1m: pd.DataFrame) -> pd.DataFrame:
     return df_15
 
 
+def resample_30m(df: pd.DataFrame) -> pd.DataFrame:
+    """Resample any-TF OHLC to 30-min OHLC."""
+    agg = {"open": "first", "high": "max", "low": "min", "close": "last"}
+    return df.resample("30min", label="left", closed="left").agg(agg).dropna()
+
+
 # ---------------------------------------------------------------------------
 # 2. Indicators
 # ---------------------------------------------------------------------------
@@ -246,7 +252,8 @@ def detect_signals(df_1m: pd.DataFrame, df_15: pd.DataFrame,
                    df_3m: Optional[pd.DataFrame] = None,
                    swing_high: Optional[np.ndarray] = None,
                    swing_low: Optional[np.ndarray] = None,
-                   session_hours: Optional[set[int]] = None) -> list[Signal]:
+                   session_hours: Optional[set[int]] = None,
+                   bias_tf_minutes: int = 15) -> list[Signal]:
     """
     Candle Theory — setup on 15M, entry trigger on 1M.
 
@@ -301,8 +308,8 @@ def detect_signals(df_1m: pd.DataFrame, df_15: pd.DataFrame,
             continue
         which = "P1" if is_p1 else "P2"
 
-        # Setup-candle closes at t15[i] + 15min; entry window is the next 15M
-        setup_close = t15[i] + pd.Timedelta(minutes=15)
+        # Setup-candle closes at t15[i] + bias_tf_minutes; entry window is the next bias bar
+        setup_close = t15[i] + pd.Timedelta(minutes=bias_tf_minutes)
         start_idx = pos1.get(setup_close)
         if start_idx is None:
             continue
@@ -500,6 +507,7 @@ def run_matrix(df_lower: pd.DataFrame, df_15: pd.DataFrame,
                swing_high: Optional[np.ndarray] = None,
                swing_low: Optional[np.ndarray] = None,
                session_hours: Optional[set[int]] = None,
+               bias_tf_minutes: int = 15,
                rr_grid=(1.0, 1.5, 2.0, 3.0, 4.0, 5.0),
                buf_grid=(2.0, 3.0),
                patterns=("P1", "P2", "both")) -> pd.DataFrame:
@@ -522,6 +530,7 @@ def run_matrix(df_lower: pd.DataFrame, df_15: pd.DataFrame,
                     sl_method=sl_method, sl_buffer=buf,
                     df_3m=df_3m, swing_high=swing_high, swing_low=swing_low,
                     session_hours=session_hours,
+                    bias_tf_minutes=bias_tf_minutes,
                 )
                 for rr in rr_grid:
                     trs = simulate(sigs, df_lower, rr=rr, max_bars=max_bars)
@@ -550,11 +559,13 @@ def detect_interval_minutes(df: pd.DataFrame) -> float:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", required=True, help="Path to OHLC CSV (M1 or M15)")
-    ap.add_argument("--mode", choices=("auto", "m1", "m15"), default="auto",
-                    help="m1 = setup on 15M (resampled), trigger on 1M; "
-                         "m15 = everything on 15M; auto detects from data")
-    ap.add_argument("--sl-method", choices=("ema21", "swing3m"), default="swing3m",
-                    help="SL placement: ema21 (legacy) or swing3m (most recent 3-min swing)")
+    ap.add_argument("--mode", choices=("auto", "m1", "m15", "m30_15"), default="auto",
+                    help="m1 = bias 15M, entry 1M; "
+                         "m15 = bias 15M, entry 15M; "
+                         "m30_15 = bias 30M, entry 15M; "
+                         "auto detects m1/m15 from data interval.")
+    ap.add_argument("--sl-method", choices=("ema21", "swing3m", "swing15m"), default="swing3m",
+                    help="SL placement: ema21 / swing3m (1M data needed) / swing15m")
     ap.add_argument("--session", default=None,
                     help="Comma-separated allowed entry hours (UTC of the data), "
                          "e.g. '2,5,8,13,14,15,16,22'. If omitted, no filter.")
@@ -584,6 +595,7 @@ def main() -> None:
 
     df_3m = None
     swing_high = swing_low = None
+    bias_tf_minutes = 15
 
     if mode == "m1":
         df_1m = add_entry_indicators(df)
@@ -595,7 +607,39 @@ def main() -> None:
             df_3m = resample_3m(df_1m)
             swing_high, swing_low = find_swings_3m(df_3m)
             print(f"  3M bars: {len(df_3m):,}  swings: highs={swing_high.sum():,} lows={swing_low.sum():,}")
+        elif args.sl_method == "swing15m":
+            df_3m = df_lower  # use 1M for swing detection (rare; default to swing3m)
+            swing_high, swing_low = find_swings_3m(df_lower)
         print(f"  {len(df_15):,} 15-min bars (resampled)")
+    elif mode == "m30_15":
+        # Bias on 30M, candle theory + entry on 15M
+        bias_tf_minutes = 30
+        if iv < 5:  # M1 input -> resample to 15M and 30M
+            df_1m = add_entry_indicators(df)
+            df_15 = add_entry_indicators(resample_15m(df_1m))  # ema8/21 on 15M
+            df_30 = add_bias_indicators(resample_30m(df_1m))
+            print(f"  resampled: {len(df_15):,} 15M bars, {len(df_30):,} 30M bars (from 1M)")
+        else:  # M15 input -> resample to 30M
+            df_15 = add_entry_indicators(df)
+            df_30 = add_bias_indicators(resample_30m(df_15))
+            print(f"  {len(df_15):,} 15M bars (input), {len(df_30):,} 30M bars (resampled)")
+        df_lower = df_15
+        df_15 = df_30  # bias container is now 30M (variable kept named df_15 in engine)
+        wait_bars = 2  # next 30M = 2 15M bars
+        max_bars = 32  # ~8 hours of 15M
+
+        if args.sl_method == "swing3m":
+            if iv < 5:
+                df_3m = resample_3m(df_1m)
+                swing_high, swing_low = find_swings_3m(df_3m)
+                print(f"  3M swings: highs={swing_high.sum():,} lows={swing_low.sum():,}")
+            else:
+                print("  WARNING: 3M swing not available with M15 input; falling back to swing15m")
+                args.sl_method = "swing15m"
+        if args.sl_method == "swing15m":
+            df_3m = df_lower  # reuse the swing helper on 15M data
+            swing_high, swing_low = find_swings_3m(df_lower)
+            print(f"  15M swings: highs={swing_high.sum():,} lows={swing_low.sum():,}")
     else:  # m15
         df_15 = add_bias_indicators(add_entry_indicators(df))
         df_lower = df_15
@@ -604,6 +648,9 @@ def main() -> None:
         if args.sl_method == "swing3m":
             print("  WARNING: swing3m not available in m15 mode (no sub-15M data); falling back to ema21")
             args.sl_method = "ema21"
+        if args.sl_method == "swing15m":
+            df_3m = df_15
+            swing_high, swing_low = find_swings_3m(df_15)
 
     session_hours = None
     if args.session:
@@ -620,6 +667,7 @@ def main() -> None:
                      sl_method=args.sl_method, df_3m=df_3m,
                      swing_high=swing_high, swing_low=swing_low,
                      session_hours=session_hours,
+                     bias_tf_minutes=bias_tf_minutes,
                      rr_grid=rr_grid, buf_grid=buf_grid, patterns=pats)
     res["mode"] = mode
     res["sl_method"] = args.sl_method
@@ -635,7 +683,8 @@ def main() -> None:
                           pattern=best["pattern"], wait_bars=wait_bars,
                           sl_method=args.sl_method, sl_buffer=best["sl_buf"],
                           df_3m=df_3m, swing_high=swing_high, swing_low=swing_low,
-                          session_hours=session_hours)
+                          session_hours=session_hours,
+                          bias_tf_minutes=bias_tf_minutes)
     trs = simulate(sigs, df_lower, rr=best["rr"], max_bars=max_bars)
     pd.DataFrame([t.__dict__ for t in trs]).to_csv(args.trades_out, index=False)
     print(f"Best config trade log -> {args.trades_out}")
