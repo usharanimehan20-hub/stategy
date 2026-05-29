@@ -171,11 +171,82 @@ class Signal:
     entry: float         # entry price (close of confirmation candle)
     pattern: str         # "P1" or "P2"
     ema21_at_entry: float
+    sl: float = 0.0      # pre-computed SL level (raw, before buffer is added)
+
+
+def resample_3m(df_1m: pd.DataFrame) -> pd.DataFrame:
+    """Resample 1-min OHLC to 3-min OHLC."""
+    agg = {"open": "first", "high": "max", "low": "min", "close": "last"}
+    return df_1m.resample("3min", label="left", closed="left").agg(agg).dropna()
+
+
+def find_swings_3m(df_3m: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Find 3-bar fractal swing highs/lows on 3-minute data.
+    A swing high at bar i: high[i] > high[i-1] AND high[i] > high[i+1].
+    Returns two boolean arrays aligned with df_3m: (swing_high, swing_low).
+    Bar i's swing status is only confirmed once bar i+1 has closed.
+    """
+    h = df_3m["high"].values
+    l = df_3m["low"].values
+    n = len(df_3m)
+    sh = np.zeros(n, dtype=bool)
+    sl = np.zeros(n, dtype=bool)
+    for i in range(1, n - 1):
+        if h[i] > h[i - 1] and h[i] > h[i + 1]:
+            sh[i] = True
+        if l[i] < l[i - 1] and l[i] < l[i + 1]:
+            sl[i] = True
+    return sh, sl
+
+
+def latest_swing_sl(entry_time: pd.Timestamp, direction: int,
+                    df_3m: pd.DataFrame, sh: np.ndarray, sl: np.ndarray,
+                    buffer_pts: float, lookback_bars: int = 10) -> Optional[float]:
+    """
+    Find the most recent confirmed 3M swing high/low strictly before entry_time
+    within the last `lookback_bars` 3M bars (default 10 bars = 30 min, what a
+    screen-trader actually sees as the relevant structure).
+
+    For long: SL = swing_low - buffer. For short: SL = swing_high + buffer.
+
+    Confirmation lag: a swing at 3M bar i is only confirmed once bar i+1 closes,
+    so we require the swing bar's index <= position(entry_time) - 2.
+
+    Fallback: if no confirmed fractal swing in the lookback window, use the
+    extreme low/high of the lookback window itself (Donchian-style).
+    """
+    pos = df_3m.index.searchsorted(entry_time, side="right") - 1
+    confirmed_max_idx = pos - 1
+    lookback_min_idx = max(0, pos - lookback_bars)
+    if confirmed_max_idx < lookback_min_idx:
+        return None
+
+    if direction == 1:
+        # Look for fractal swing low in the lookback window
+        idxs = np.where(sl[lookback_min_idx: confirmed_max_idx + 1])[0]
+        if len(idxs) > 0:
+            last = lookback_min_idx + idxs[-1]
+            return float(df_3m["low"].iloc[last]) - buffer_pts
+        # Fallback: lowest low in the lookback window
+        return float(df_3m["low"].iloc[lookback_min_idx: pos + 1].min()) - buffer_pts
+    else:
+        idxs = np.where(sh[lookback_min_idx: confirmed_max_idx + 1])[0]
+        if len(idxs) > 0:
+            last = lookback_min_idx + idxs[-1]
+            return float(df_3m["high"].iloc[last]) + buffer_pts
+        return float(df_3m["high"].iloc[lookback_min_idx: pos + 1].max()) + buffer_pts
 
 
 def detect_signals(df_1m: pd.DataFrame, df_15: pd.DataFrame,
                    bias_15: pd.Series, pattern: str = "both",
-                   wait_bars: int = 15) -> list[Signal]:
+                   wait_bars: int = 15,
+                   sl_method: str = "ema21",
+                   sl_buffer: float = 2.0,
+                   df_3m: Optional[pd.DataFrame] = None,
+                   swing_high: Optional[np.ndarray] = None,
+                   swing_low: Optional[np.ndarray] = None,
+                   session_hours: Optional[set[int]] = None) -> list[Signal]:
     """
     Candle Theory — setup on 15M, entry trigger on 1M.
 
@@ -255,9 +326,23 @@ def detect_signals(df_1m: pd.DataFrame, df_15: pd.DataFrame,
             body_ok = (b == 1 and c1[j] > o1[j]) or (b == -1 and c1[j] < o1[j])
             bos_ok = (b == 1 and c1[j] > c1[j - 1]) or (b == -1 and c1[j] < c1[j - 1])
             if body_ok and bos_ok:
+                # Session filter (entry hour)
+                if session_hours is not None and t1[j].hour not in session_hours:
+                    break  # setup expired this window if hour disallowed
+                # Pre-compute SL based on chosen method
+                if sl_method == "swing3m":
+                    sl_lvl = latest_swing_sl(t1[j], b, df_3m, swing_high, swing_low, sl_buffer)
+                    if sl_lvl is None:
+                        break
+                    # Validity check: SL must be on correct side of entry
+                    if (b == 1 and sl_lvl >= c1[j]) or (b == -1 and sl_lvl <= c1[j]):
+                        break
+                else:  # "ema21"
+                    sl_lvl = (e21_1[j] - sl_buffer) if b == 1 else (e21_1[j] + sl_buffer)
                 signals.append(Signal(
                     time=t1[j], direction=b, entry=float(c1[j]),
                     pattern=which, ema21_at_entry=float(e21_1[j]),
+                    sl=float(sl_lvl),
                 ))
                 break  # one entry per setup
     return signals
@@ -283,11 +368,11 @@ class Trade:
 
 
 def simulate(signals: list[Signal], df_1m: pd.DataFrame,
-             rr: float, sl_buffer: float,
+             rr: float,
              spread_pts: float = 0.3,
              max_bars: int = 240) -> list[Trade]:
     """
-    For each signal, set SL = EMA21 ± buffer, TP = entry ± rr * SL_distance.
+    For each signal, use the pre-computed `sig.sl`, derive TP from RR x risk.
     Walk forward bar-by-bar; if same bar hits both, assume SL first (conservative).
     No pyramiding: skip new signals while a position is open.
     """
@@ -303,15 +388,13 @@ def simulate(signals: list[Signal], df_1m: pd.DataFrame,
         if i0 is None or i0 < busy_until:
             continue
 
-        # Stop placement
+        sl = sig.sl
         if sig.direction == 1:
-            sl = sig.ema21_at_entry - sl_buffer
-            if sl >= sig.entry:  # malformed; skip
+            if sl >= sig.entry:
                 continue
             risk = sig.entry - sl
             tp = sig.entry + rr * risk
         else:
-            sl = sig.ema21_at_entry + sl_buffer
             if sl <= sig.entry:
                 continue
             risk = sl - sig.entry
@@ -412,31 +495,40 @@ def metrics(trades: list[Trade]) -> dict:
 
 def run_matrix(df_lower: pd.DataFrame, df_15: pd.DataFrame,
                wait_bars: int, max_bars: int,
+               sl_method: str = "ema21",
+               df_3m: Optional[pd.DataFrame] = None,
+               swing_high: Optional[np.ndarray] = None,
+               swing_low: Optional[np.ndarray] = None,
+               session_hours: Optional[set[int]] = None,
                rr_grid=(1.0, 1.5, 2.0, 3.0, 4.0, 5.0),
                buf_grid=(2.0, 3.0),
                patterns=("P1", "P2", "both")) -> pd.DataFrame:
     """
     df_lower: timeframe used for entry trigger (1M for Mode A, 15M for Mode B).
-              Must contain ema8, ema21 columns.
     df_15:    15M bars carrying bias MAs.
     wait_bars: how many df_lower bars after a 15M setup-candle close to wait
                for an entry trigger. (15 for Mode A, 1 for Mode B.)
     max_bars: max df_lower bars to hold a trade before timing out.
+    sl_method: "ema21" (legacy) or "swing3m" (most recent 3-min swing high/low).
     """
     rows = []
     for combo_name, ma_cols in MA_COMBOS.items():
         bias_15 = classify_bias(df_15, ma_cols)
 
         for pat in patterns:
-            sigs = detect_signals(df_lower, df_15, bias_15,
-                                  pattern=pat, wait_bars=wait_bars)
-            for rr, buf in itertools.product(rr_grid, buf_grid):
-                trs = simulate(sigs, df_lower, rr=rr, sl_buffer=buf,
-                               max_bars=max_bars)
-                m = metrics(trs)
-                m.update({"ma_combo": combo_name, "pattern": pat,
-                          "rr": rr, "sl_buf": buf})
-                rows.append(m)
+            for buf in buf_grid:
+                sigs = detect_signals(
+                    df_lower, df_15, bias_15, pattern=pat, wait_bars=wait_bars,
+                    sl_method=sl_method, sl_buffer=buf,
+                    df_3m=df_3m, swing_high=swing_high, swing_low=swing_low,
+                    session_hours=session_hours,
+                )
+                for rr in rr_grid:
+                    trs = simulate(sigs, df_lower, rr=rr, max_bars=max_bars)
+                    m = metrics(trs)
+                    m.update({"ma_combo": combo_name, "pattern": pat,
+                              "rr": rr, "sl_buf": buf})
+                    rows.append(m)
     df = pd.DataFrame(rows)
     cols = ["ma_combo", "pattern", "rr", "sl_buf",
             "trades", "win_rate", "tp_rate", "sl_rate",
@@ -461,6 +553,11 @@ def main() -> None:
     ap.add_argument("--mode", choices=("auto", "m1", "m15"), default="auto",
                     help="m1 = setup on 15M (resampled), trigger on 1M; "
                          "m15 = everything on 15M; auto detects from data")
+    ap.add_argument("--sl-method", choices=("ema21", "swing3m"), default="swing3m",
+                    help="SL placement: ema21 (legacy) or swing3m (most recent 3-min swing)")
+    ap.add_argument("--session", default=None,
+                    help="Comma-separated allowed entry hours (UTC of the data), "
+                         "e.g. '2,5,8,13,14,15,16,22'. If omitted, no filter.")
     ap.add_argument("--tz", default=None, help="Optional timezone localization")
     ap.add_argument("--quick", action="store_true",
                     help="Use a smaller matrix for fast smoke test")
@@ -480,24 +577,38 @@ def main() -> None:
     iv = detect_interval_minutes(df)
     print(f"  {len(df):,} bars from {df.index[0]} to {df.index[-1]}  median interval={iv:.0f}min")
 
-    # Resolve mode
     mode = args.mode
     if mode == "auto":
         mode = "m1" if iv < 5 else "m15"
-    print(f"  mode = {mode}")
+    print(f"  mode = {mode}  sl_method = {args.sl_method}")
+
+    df_3m = None
+    swing_high = swing_low = None
 
     if mode == "m1":
         df_1m = add_entry_indicators(df)
         df_15 = add_bias_indicators(resample_15m(df_1m))
         df_lower = df_1m
         wait_bars = 15
-        max_bars = 240          # ~4 hours
+        max_bars = 240
+        if args.sl_method == "swing3m":
+            df_3m = resample_3m(df_1m)
+            swing_high, swing_low = find_swings_3m(df_3m)
+            print(f"  3M bars: {len(df_3m):,}  swings: highs={swing_high.sum():,} lows={swing_low.sum():,}")
         print(f"  {len(df_15):,} 15-min bars (resampled)")
     else:  # m15
         df_15 = add_bias_indicators(add_entry_indicators(df))
-        df_lower = df_15        # entry trigger uses 15M itself
+        df_lower = df_15
         wait_bars = 1
-        max_bars = 16           # ~4 hours
+        max_bars = 16
+        if args.sl_method == "swing3m":
+            print("  WARNING: swing3m not available in m15 mode (no sub-15M data); falling back to ema21")
+            args.sl_method = "ema21"
+
+    session_hours = None
+    if args.session:
+        session_hours = {int(x.strip()) for x in args.session.split(",") if x.strip()}
+        print(f"  session filter: hours {sorted(session_hours)}")
 
     if args.quick:
         rr_grid, buf_grid, pats = (1.0, 2.0, 3.0), (2.0,), ("both",)
@@ -506,21 +617,26 @@ def main() -> None:
 
     print(f"Running matrix ({len(MA_COMBOS) * len(pats) * len(rr_grid) * len(buf_grid)} configs) ...")
     res = run_matrix(df_lower, df_15, wait_bars=wait_bars, max_bars=max_bars,
+                     sl_method=args.sl_method, df_3m=df_3m,
+                     swing_high=swing_high, swing_low=swing_low,
+                     session_hours=session_hours,
                      rr_grid=rr_grid, buf_grid=buf_grid, patterns=pats)
     res["mode"] = mode
+    res["sl_method"] = args.sl_method
     res.to_csv(args.out, index=False, float_format="%.3f")
     print(f"\nSaved {len(res)} configs -> {args.out}")
     print("\nTop 15 by net points:")
     print(res.head(15).to_string(index=False))
 
-    # Re-simulate the best config to dump trade-level CSV
     best = res.iloc[0]
     ma_cols = MA_COMBOS[best["ma_combo"]]
     bias_15 = classify_bias(df_15, ma_cols)
     sigs = detect_signals(df_lower, df_15, bias_15,
-                          pattern=best["pattern"], wait_bars=wait_bars)
-    trs = simulate(sigs, df_lower, rr=best["rr"],
-                   sl_buffer=best["sl_buf"], max_bars=max_bars)
+                          pattern=best["pattern"], wait_bars=wait_bars,
+                          sl_method=args.sl_method, sl_buffer=best["sl_buf"],
+                          df_3m=df_3m, swing_high=swing_high, swing_low=swing_low,
+                          session_hours=session_hours)
+    trs = simulate(sigs, df_lower, rr=best["rr"], max_bars=max_bars)
     pd.DataFrame([t.__dict__ for t in trs]).to_csv(args.trades_out, index=False)
     print(f"Best config trade log -> {args.trades_out}")
 
